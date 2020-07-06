@@ -48,7 +48,7 @@
 using namespace std;
 
 namespace {
-    const int MAX_OUTBOUND_CONNECTIONS = 8;
+    const int MAX_OUTBOUND_CONNECTIONS = 32; // 8; // rotate a peer every ~10s, connect to 5% of the peers
 
     struct ListenSocket {
         SOCKET socket;
