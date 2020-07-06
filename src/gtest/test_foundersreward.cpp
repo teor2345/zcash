@@ -3,6 +3,8 @@
 #include "main.h"
 #include "utilmoneystr.h"
 #include "chainparams.h"
+#include "consensus/funding.h"
+#include "key_io.h"
 #include "utilstrencodings.h"
 #include "zcash/Address.hpp"
 #include "wallet/wallet.h"
@@ -125,7 +127,7 @@ TEST(FoundersRewardTest, General) {
     EXPECT_DEATH(params.GetFoundersRewardAddressAtHeight(maxHeight+1), "nHeight"); 
 }
 
-TEST(founders_reward_test, regtest_get_last_block_blossom) {
+TEST(FoundersRewardTest, RegtestGetLastBlockBlossom) {
     int blossomActivationHeight = Consensus::PRE_BLOSSOM_REGTEST_HALVING_INTERVAL / 2; // = 75
     auto params = RegtestActivateBlossom(false, blossomActivationHeight);
     int lastFRHeight = params.GetLastFoundersRewardBlockHeight(blossomActivationHeight);
@@ -134,7 +136,7 @@ TEST(founders_reward_test, regtest_get_last_block_blossom) {
     RegtestDeactivateBlossom();
 }
 
-TEST(founders_reward_test, mainnet_get_last_block) {
+TEST(FoundersRewardTest, MainnetGetLastBlock) {
     SelectParams(CBaseChainParams::MAIN);
     auto params = Params().GetConsensus();
     int lastFRHeight = GetLastFoundersRewardHeight(params);
@@ -215,4 +217,66 @@ TEST(FoundersRewardTest, PerAddressRewardMainnet) {
 TEST(FoundersRewardTest, PerAddressRewardTestnet) {
     SelectParams(CBaseChainParams::TESTNET);
     verifyNumberOfRewards();
+}
+
+// Verify that post-Canopy, block rewards are split according to ZIP 207.
+TEST(FundingStreamsRewardTest, Zip207Distribution) {
+    auto consensus = RegtestActivateCanopy(false, 200);
+
+    int minHeight = GetLastFoundersRewardHeight(consensus) + 1;
+
+    auto sk = libzcash::SaplingSpendingKey(uint256());
+    for (int idx = Consensus::FIRST_FUNDING_STREAM; idx < Consensus::MAX_FUNDING_STREAMS; idx++) {
+        // we can just use the same addresses for all streams, all we're trying to do here
+        // is validate that the streams add up to the 20% of block reward.
+        UpdateFundingStreamParameters(
+            (Consensus::FundingStreamIndex) idx,
+            Consensus::FundingStream::ParseFundingStream(
+                consensus,
+                minHeight, 
+                minHeight + 12, 
+                {
+                    "t2UNzUUx8mWBCRYPRezvA363EYXyEpHokyi",
+                    EncodePaymentAddress(sk.default_address())
+                }
+            )
+        );
+    }
+
+    int maxHeight = GetMaxFundingStreamHeight(consensus);
+    std::map<std::string, CAmount> ms;
+    for (int nHeight = minHeight; nHeight <= maxHeight; nHeight++) {
+        auto blockSubsidy = GetBlockSubsidy(nHeight, consensus);
+        auto elems = GetActiveFundingStreamElements(nHeight, blockSubsidy, consensus);
+
+        CAmount totalFunding = 0;
+        for (Consensus::FundingStreamElement elem : elems) {
+            totalFunding += elem.second;
+        }
+        EXPECT_EQ(totalFunding, blockSubsidy / 5);
+    }
+
+    RegtestDeactivateCanopy();
+}
+
+TEST(FundingStreamsRewardTest, ParseFundingStream) {
+    auto consensus = RegtestActivateCanopy(false, 200);
+
+    int minHeight = GetLastFoundersRewardHeight(consensus) + 1;
+
+    auto sk = libzcash::SaplingSpendingKey(uint256());
+    ASSERT_THROW(
+        Consensus::FundingStream::ParseFundingStream(
+            consensus,
+            minHeight, 
+            minHeight + 13, 
+            {
+                "t2UNzUUx8mWBCRYPRezvA363EYXyEpHokyi",
+                EncodePaymentAddress(sk.default_address())
+            }
+        ),
+        std::runtime_error
+    );
+
+    RegtestDeactivateCanopy();
 }

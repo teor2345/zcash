@@ -15,11 +15,13 @@
 #include "checkpoints.h"
 #include "checkqueue.h"
 #include "consensus/consensus.h"
+#include "consensus/funding.h"
 #include "consensus/upgrades.h"
 #include "consensus/validation.h"
 #include "deprecation.h"
 #include "experimental_features.h"
 #include "init.h"
+#include "key_io.h"
 #include "merkleblock.h"
 #include "metrics.h"
 #include "net.h"
@@ -901,6 +903,20 @@ bool ContextualCheckTransaction(
         }
     }
 
+    // From Canopy onward, coinbase transaction must include outputs corresponding to the
+    // ZIP 207 consensus funding streams active at the current block height. To avoid
+    // double-decrypting, we detect any shielded funding streams during the Heartwood
+    // consensus check. If Canopy is not yet active, requiredStreams will be empty.
+    std::set<Consensus::FundingStreamElement> fundingStreamElements;
+    if (canopyActive) {
+        fundingStreamElements = Consensus::GetActiveFundingStreamElements(
+            nHeight,
+            // GetBlockSubsidy must be guarded because it will throw
+            // if called at slow-start period heights.
+            GetBlockSubsidy(nHeight, chainparams.GetConsensus()),
+            chainparams.GetConsensus());
+    }
+
     // Rules that apply to Heartwood or later:
     if (heartwoodActive) {
         if (tx.IsCoinBase()) {
@@ -920,19 +936,54 @@ bool ContextualCheckTransaction(
                 }
 
                 // SaplingNotePlaintext::decrypt() checks note commitment validity.
-                if (!SaplingNotePlaintext::decrypt(
+                auto notePlaintext = SaplingNotePlaintext::decrypt(
                     output.encCiphertext,
                     output.ephemeralKey,
                     outPlaintext->esk,
                     outPlaintext->pk_d,
-                    output.cmu)
-                ) {
+                    output.cmu);
+
+                if (!notePlaintext) {
                     return state.DoS(
                         DOS_LEVEL_BLOCK,
                         error("CheckTransaction(): coinbase output description has invalid encCiphertext"),
                         REJECT_INVALID,
                         "bad-cb-output-desc-invalid-encct");
                 }
+
+                // Detect any ZIP 207 shielded funding streams.
+                if (canopyActive) {
+                    libzcash::SaplingPaymentAddress zaddr(notePlaintext->d, outPlaintext->pk_d);
+                    for (auto it = fundingStreamElements.begin(); it != fundingStreamElements.end(); ++it) {
+                        const libzcash::SaplingPaymentAddress* streamAddr = boost::get<libzcash::SaplingPaymentAddress>(&(it->first));
+                        if (streamAddr && zaddr == *streamAddr && notePlaintext->value() == it->second) {
+                            fundingStreamElements.erase(it);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Rules that apply to Canopy or later:
+    if (canopyActive) {
+        if (tx.IsCoinBase()) {
+            // Detect transparent funding streams.
+            for (const CTxOut& output : tx.vout) {
+                for (auto it = fundingStreamElements.begin(); it != fundingStreamElements.end(); ++it) {
+                    const CScript* taddr = boost::get<CScript>(&(it->first));
+                    if (taddr && output.scriptPubKey == *taddr && output.nValue == it->second) {
+                        fundingStreamElements.erase(it);
+                        break;
+                    }
+                }
+            }
+
+            if (!fundingStreamElements.empty()) {
+                std::cout << "\nFunding stream missing at height " << nHeight;
+                return state.DoS(100, error("%s: funding stream missing", __func__),
+                                 REJECT_INVALID, "cb-funding-stream-missing");
             }
         }
     }
@@ -4111,12 +4162,14 @@ bool ContextualCheckBlock(
         }
     }
 
-    // Coinbase transaction must include an output sending 20% of
-    // the block subsidy to a Founders' Reward script, until the last Founders'
-    // Reward block is reached, with exception of the genesis block.
-    // The last Founders' Reward block is defined as the block just before the
-    // first subsidy halving block, which occurs at halving_interval + slow_start_shift.
-    if ((nHeight > 0) && (nHeight <= consensusParams.GetLastFoundersRewardBlockHeight(nHeight))) {
+    if (consensusParams.NetworkUpgradeActive(nHeight, Consensus::UPGRADE_CANOPY)) {
+        // Funding streams are checked inside ContextualCheckTransaction.
+    } else if ((nHeight > 0) && (nHeight <= consensusParams.GetLastFoundersRewardBlockHeight(nHeight))) {
+        // Coinbase transaction must include an output sending 20% of
+        // the block subsidy to a Founders' Reward script, until the last Founders'
+        // Reward block is reached, with exception of the genesis block.
+        // The last Founders' Reward block is defined as the block just before the
+        // first subsidy halving block, which occurs at halving_interval + slow_start_shift.
         bool found = false;
 
         BOOST_FOREACH(const CTxOut& output, block.vtx[0].vout) {
